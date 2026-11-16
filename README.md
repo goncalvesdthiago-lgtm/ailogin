@@ -27,6 +27,8 @@ Você tem uma conta pessoal e outra do trabalho no Claude Code, no Codex, no Gem
  ↑↓ mover   1-9 abrir direto   enter abrir   n nova   r renomear   d apagar   q sair
 ```
 
+📖 **Quer aprender a usar passo a passo?** Veja o [Manual](MANUAL.md).
+
 ## Instalar
 
 ### O que você precisa
