@@ -1,0 +1,5 @@
+# Copie para ~/.ailogin/clis.conf para cadastrar outras IAs.
+# Formato:  id|Nome bonito|comando|modo|cor(R;G;B)
+#   modo "home"          = HOME virtual por conta (serve para quase qualquer CLI)
+#   modo "env:VARIAVEL"  = o CLI tem uma variável que aponta a pasta de configuração
+minhaia|Minha IA|minhaia|home|255;0;128

@@ -1,0 +1,343 @@
+#!/usr/bin/env bash
+# ailogin: várias contas de várias IAs (claude, codex, gemini, agy, kiro, copilot e outras) logadas ao mesmo tempo.
+# Inspirado no favo-cli (Irwin Arruda): cada conta tem uma pasta própria e o comando só
+# aponta o CLI para ela. Nada de deslogar para trocar.
+#
+#   ailogin                       menu: escolhe o CLI e depois a conta
+#   ailogin <cli> [conta] [args]  abre direto (sem conta, mostra o menu daquele CLI)
+#   ailogin add <cli> <conta>     cria a conta (e abre o CLI para você fazer o login)
+#   ailogin ultima                reabre a última conta usada
+#   ailogin ls                    lista tudo
+#   ailogin rename <cli> <conta> <novo>  troca o nome (o login continua valendo)
+#   ailogin rm <cli> <conta>      apaga a conta (pede confirmação)
+#   ailogin login <cli> <conta>   refaz o login
+set -u
+mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null; }
+VERSAO="1.0.0"
+# Onde ficam as contas: AILOGIN_DIR, ou ~/.ailogin (se já existir uma pasta antiga em ~/.claude/ailogin, usa ela).
+if [ -n "${AILOGIN_DIR:-}" ]; then RAIZ="$AILOGIN_DIR"
+elif [ -d "$HOME/.claude/ailogin" ] && [ ! -d "$HOME/.ailogin" ]; then RAIZ="$HOME/.claude/ailogin"
+else RAIZ="$HOME/.ailogin"; fi
+
+# Catálogo de IAs: id|nome|binário|modo|cor
+#   modo "env:VAR" = o CLI aceita uma variável que aponta a pasta de configuração
+#   modo "home"    = HOME virtual por conta (serve para quase qualquer CLI)
+# Para incluir outra IA, crie clis.conf dentro da pasta das contas (~/.ailogin/clis.conf) com linhas nesse mesmo formato.
+CATALOGO='claude|Claude Code|claude|env:CLAUDE_CONFIG_DIR|217;119;87
+codex|Codex|codex|env:CODEX_HOME|16;185;129
+gemini|Gemini CLI|gemini|env:GEMINI_CLI_HOME|66;133;244
+agy|Antigravity|agy|home|168;123;255
+kiro|Kiro|kiro-cli|home|255;196;61
+copilot|GitHub Copilot|copilot|home|200;200;215
+opencode|OpenCode|opencode|home|60;200;220
+cursor|Cursor Agent|cursor-agent|home|240;240;240
+qwen|Qwen Code|qwen|home|120;110;255
+amp|Amp|amp|home|255;90;90
+droid|Droid (Factory)|droid|home|255;150;60'
+catalogo() { printf '%s\n' "$CATALOGO"; [ -f "$RAIZ/clis.conf" ] && grep -E '^[a-z0-9_-]+\|' "$RAIZ/clis.conf"; }
+campo() { catalogo | awk -F'|' -v c="$1" -v n="$2" '$1==c{l=$n} END{print l}'; }  # a última linha vence
+CLIS="$(catalogo | awk -F'|' '!s[$1]++{printf "%s ", $1}')"; CLIS="${CLIS% }"
+bin_do() { campo "$1" 3; }
+
+# Status do login, lendo só arquivos da conta (rápido, não abre o CLI). Vazio = não dá para saber.
+status_login() { # cli id
+  local d="$RAIZ/$1/$2" r=""
+  case "$1" in
+    claude) r="$(grep -o '"emailAddress": *"[^"]*"' "$d/.claude.json" 2>/dev/null | head -1 | sed 's/.*: *"//; s/"$//')"
+            echo "${r:-sem login}" ;;
+    codex)  if [ -s "$d/auth.json" ]; then
+              r="$(python3 -I -c 'import json,base64,sys
+a=json.load(open(sys.argv[1])); t=a.get("tokens",{}).get("id_token","")
+p=t.split(".")[1]; p+="="*(-len(p)%4); print(json.loads(base64.urlsafe_b64decode(p)).get("email",""))' "$d/auth.json" 2>/dev/null)"
+              echo "${r:-logado}"
+            else echo "sem login"; fi ;;
+    gemini) if [ -s "$d/.gemini/google_accounts.json" ]; then
+              r="$(grep -o '"active": *"[^"]*"' "$d/.gemini/google_accounts.json" | sed 's/.*: *"//; s/"$//')"; echo "${r:-logado}"
+            elif [ -s "$d/.gemini/oauth_creds.json" ]; then echo logado; else echo "sem login"; fi ;;
+    kiro)   local db="$d/home/Library/Application Support/kiro-cli/data.sqlite3"
+            if [ -f "$db" ] && sqlite3 "$db" "select 1 from auth_kv where key like '%token%' limit 1" 2>/dev/null | grep -q 1
+            then
+              local c="$d/.ailogin-email"   # o e-mail só vem pelo "whoami" (lento): guardo para as próximas vezes
+              [ -s "$c" ] || HOME="$d/home" kiro-cli whoami 2>/dev/null | sed -n 's/^Email: *//p' > "$c"
+              r="$(cat "$c" 2>/dev/null)"; echo "${r:-logado}"
+            else rm -f "$d/.ailogin-email"; echo "sem login"; fi ;;
+  esac
+}
+ultimo_uso() { # cli id -> hoje / ontem / há N d / nunca
+  local m now d; m="$(mtime "$RAIZ/$1/$2/.ailogin-uso")" || { echo nunca; return; }
+  now="$(date +%s)"; d=$(( (now-m)/86400 ))
+  case "$d" in 0) echo hoje ;; 1) echo ontem ;; *) echo "há $d d" ;; esac
+}
+
+# Monta o ambiente isolado e executa o CLI.
+rodar() {
+  local cli="$1" conta="$2"; shift 2
+  local dir="$RAIZ/$cli/$conta" bin; bin="$(bin_do "$cli")"
+  [ -d "$dir" ] || { echo "conta '$conta' de $cli não existe. Use: ailogin add $cli $conta" >&2; return 1; }
+  command -v "$bin" >/dev/null || { echo "$bin não está instalado" >&2; return 1; }
+  local rot em; rot="$(rotulo "$cli" "$conta")"; em="$(status_login "$cli" "$conta")"
+  touch "$dir/.ailogin-uso"
+  export AILOGIN_ATIVA="$cli:$rot" AILOGIN_EMAIL="${em#sem login}"
+  if [ -t 1 ] && [ $# -eq 0 ]; then   # aviso de qual conta está aberta (só no uso interativo)
+    printf '\e]0;ailogin · %s · %s\a' "$cli" "$rot"
+    printf '\e[1;38;2;%sm▸ ailogin\e[0m  %s · %s%s\n\n' "$(cor_cli "$cli")" "$(nome_bonito "$cli")" "$rot" "${em:+  ($em)}"
+  fi
+  local modo; modo="$(campo "$cli" 4)"
+  case "$modo" in
+    env:*) [ "$cli" = gemini ] && mkdir -p "$dir/.gemini"; exec env "${modo#env:}=$dir" "$bin" "$@" ;;
+    *)  # HOME virtual. Ligo ~/.local/bin nele porque alguns CLIs (kiro-cli) procuram helpers ali.
+      mkdir -p "$dir/home/.local"
+      [ -e "$dir/home/.local/bin" ] || ln -s "$HOME/.local/bin" "$dir/home/.local/bin"
+      HOME="$dir/home" exec "$bin" "$@" ;;
+  esac
+}
+
+# Claude novo começa vazio: ligo suas regras, skills e hooks do ~/.claude (sem o login) para não começar do zero.
+preparar() {
+  local cli="$1" dir="$2"
+  mkdir -p "$dir"; chmod 700 "$dir"
+  if [ "$cli" = claude ]; then
+    # Liga suas preferências (nunca o login): CLAUDE.md e outros .md da raiz, settings, skills, comandos, agentes, hooks.
+    local f
+    for f in "$HOME"/.claude/*.md "$HOME/.claude/settings.json" "$HOME/.claude/skills" "$HOME/.claude/commands" "$HOME/.claude/agents" "$HOME/.claude/hooks"; do
+      [ -e "$f" ] && [ ! -e "$dir/$(basename "$f")" ] && ln -s "$f" "$dir/$(basename "$f")"
+    done
+  fi
+}
+
+contas_de() { [ -d "$RAIZ/$1" ] && ls -1 "$RAIZ/$1" 2>/dev/null; }
+
+# Renomear só troca o rótulo (arquivo .ailogin-nome); a pasta (o "id") nunca muda, porque
+# o login de alguns CLIs (o Claude no Keychain do Mac) está amarrado ao caminho da pasta.
+rotulo() { local f="$RAIZ/$1/$2/.ailogin-nome"; if [ -s "$f" ]; then cat "$f"; else echo "$2"; fi; }
+resolver() { # cli nome-ou-id -> id (vazio se não achar); o rótulo vale mais que o id
+  local a
+  for a in $(contas_de "$1"); do [ "$(rotulo "$1" "$a")" = "$2" ] && { echo "$a"; return; }; done
+  [ -d "$RAIZ/$1/$2" ] && echo "$2"
+}
+nome_livre() { # cli nome [id-a-ignorar]: 0 se nenhuma outra conta usa o nome
+  local a
+  for a in $(contas_de "$1"); do
+    [ "$a" = "${3:-}" ] && continue
+    [ "$a" = "$2" ] || [ "$(rotulo "$1" "$a")" = "$2" ] && return 1
+  done
+  return 0
+}
+renomear() { # cli id novo
+  nome_livre "$1" "$3" "$2" || { echo "já existe uma conta '$3' em $1" >&2; return 1; }
+  printf '%s\n' "$3" > "$RAIZ/$1/$2/.ailogin-nome"
+}
+
+escolher() { # $1 = título, resto = opções; imprime a escolhida
+  local t="$1"; shift
+  if command -v fzf >/dev/null; then printf '%s\n' "$@" | fzf --prompt="$t > " --height=40% --reverse
+  else
+    local i=1 o; echo "$t" >&2
+    for o in "$@"; do echo "  $i) $o" >&2; i=$((i+1)); done
+    read -r -p "número: " n </dev/tty; [ "$n" -ge 1 ] 2>/dev/null && eval "echo \"\${$n}\""
+  fi
+}
+
+menu_cli() {
+  local cli="$1"; shift
+  local lista="" a conta
+  for a in $(contas_de "$cli"); do lista="$lista $(rotulo "$cli" "$a")"; done
+  [ -z "$lista" ] && { echo "nenhuma conta de $cli. Crie: ailogin add $cli <nome>" >&2; return 1; }
+  if [ "$(echo $lista | wc -w | tr -d ' ')" = 1 ]; then conta="${lista# }"
+  else conta="$(escolher "$cli" $lista)"; fi
+  [ -n "$conta" ] && rodar "$cli" "$(resolver "$cli" "$conta")" "$@"
+}
+
+valida_cli() { case " $CLIS " in *" $1 "*) ;; *) echo "CLI desconhecido: $1 (use: $CLIS)" >&2; exit 1 ;; esac; }
+valida_nome() { case "$1" in ""|*[!a-zA-Z0-9_-]*) echo "nome inválido (use letras, números, - e _)" >&2; exit 1 ;; esac; }
+
+# ───────────────────────── tela inicial (TUI) ─────────────────────────
+cor_cli() { local c; c="$(campo "$1" 5)"; echo "${c:-150;156;180}"; }
+nome_bonito() { local n; n="$(campo "$1" 2)"; echo "${n:-$1}"; }
+
+BAN=()
+montar_banner() {
+  local linhas=(
+' █████╗ ██╗██╗      ██████╗  ██████╗ ██╗███╗   ██╗'
+'██╔══██╗██║██║     ██╔═══██╗██╔════╝ ██║████╗  ██║'
+'███████║██║██║     ██║   ██║██║  ███╗██║██╔██╗ ██║'
+'██╔══██║██║██║     ██║   ██║██║   ██║██║██║╚██╗██║'
+'██║  ██║██║███████╗╚██████╔╝╚██████╔╝██║██║ ╚████║'
+'╚═╝  ╚═╝╚═╝╚══════╝ ╚═════╝  ╚═════╝ ╚═╝╚═╝  ╚═══╝')
+  local l i ch r g b len out
+  BAN=()
+  for l in "${linhas[@]}"; do
+    len=${#l}; out=""
+    for ((i=0; i<len; i++)); do
+      ch="${l:$i:1}"
+      if [ "$ch" = " " ]; then out="$out "; else
+        r=$((255 - 125*i/(len-1))); g=$((150 - 50*i/(len-1))); b=$((100 + 155*i/(len-1)))
+        out="$out"$'\e'"[38;2;${r};${g};${b}m${ch}"
+      fi
+    done
+    BAN+=("$out"$'\e[0m')
+  done
+  BANW=51
+}
+
+tecla() { # tecla "enter" "abrir"
+  printf '\e[1;38;2;235;235;245m %s \e[0m\e[2m%s\e[0m   ' "$1" "$2"
+}
+
+# Desenha a caixa com L_CLI[] / L_NOME[]; LSEL = linha marcada. $1 = título da caixa, $2 = tipo de rodapé.
+# Devolve a tecla em LKEY (enter, n, d, q).
+lista_tui() {
+  local titulo="$1" rodape="$2" n=${#L_CLI[@]}
+  local cols W pad inner namew sp hr tl i c nm mk bg bold dot key rest bpad num st sc pst
+  local R=$'\e[0m' B=$'\e[1m' D=$'\e[2m'
+  local GR=$'\e[38;2;96;102;128m' BG=$'\e[48;2;42;46;66m'
+  [ ${#BAN[@]} -eq 0 ] && montar_banner
+  while :; do
+    cols=$(tput cols); W=$((cols-4)); [ $W -gt 76 ] && W=76; [ $W -lt 38 ] && W=38
+    pad=$(( (cols-W)/2 )); [ $pad -lt 0 ] && pad=0
+    inner=$((W-2)); namew=$((inner-17))
+    printf -v sp '%*s' "$pad" ''
+    printf -v hr '%*s' "$inner" ''; hr=${hr// /─}
+    printf '\e[H\n'
+    if [ "$cols" -ge $((BANW+2)) ]; then
+      printf -v bpad '%*s' "$(( (cols-BANW)/2 ))" ''
+      for ((i=0; i<${#BAN[@]}; i++)); do printf '%s%s\e[K\n' "$bpad" "${BAN[$i]}"; done
+    else
+      printf -v bpad '%*s' "$(( (cols-7)/2 ))" ''
+      printf '%s\e[1;38;2;255;140;100mailogin%s\e[K\n' "$bpad" "$R"
+    fi
+    local sub="todas as suas contas de IA, logadas ao mesmo tempo"
+    printf -v bpad '%*s' "$(( (cols-${#sub})/2 ))" ''
+    printf '%s%s%s%s\e[K\n\n' "$bpad" "$D" "$sub" "$R"
+    # topo da caixa com título
+    tl=" $titulo "
+    printf -v hr2 '%*s' "$((inner-1-${#tl}))" ''; hr2=${hr2// /─}
+    printf '%s%s╭─%s%s%s%s%s╮%s\e[K\n' "$sp" "$GR" "$R$B" "$tl" "$R" "$GR" "$hr2" "$R"
+    printf '%s%s│%*s│%s\e[K\n' "$sp" "$GR" "$inner" "" "$R"
+    for ((i=0; i<n; i++)); do
+      c="${L_CLI[$i]}"; nm="${L_NOME[$i]:0:14}"
+      num=" "; [ "$i" -lt 9 ] && num=$((i+1))
+      st="${L_ST[$i]:-}"; [ -n "${L_USO[$i]:-}" ] && st="${st:+$st · }${L_USO[$i]}"; st="${st:0:$((namew-14))}"; pst=$((namew-14-${#st}))
+      case "$st" in "sem login"*) sc="255;120;120" ;; *) sc="120;130;160" ;; esac
+      if [ "$i" -eq "$LSEL" ]; then bg="$BG"; mk="❯"; bold="$B"; else bg=""; mk=" "; bold=""; fi
+      printf '%s%s│%s%s' "$sp" "$GR" "$R" "$bg"
+      if [ "$c" = "+" ]; then
+        printf ' \e[38;2;235;235;245m%s\e[39m \e[2m%s\e[22m \e[38;2;150;156;180m+\e[39m %-8s %s%-*s\e[22m ' "$mk" "$num" "" "$bold" "$namew" "$nm"
+      else
+        printf ' \e[38;2;%sm%s\e[39m \e[2m%s\e[22m \e[38;2;%sm●\e[39m \e[38;2;150;156;180m%-8s\e[39m %s%-14s\e[22m \e[38;2;%sm%s%*s\e[39m' "$(cor_cli "$c")" "$mk" "$num" "$(cor_cli "$c")" "$c" "$bold" "$nm" "$sc" "$st" "$pst" ""
+      fi
+      printf '%s%s│%s\e[K\n' "$R" "$GR" "$R"
+    done
+    printf '%s%s│%*s│%s\e[K\n' "$sp" "$GR" "$inner" "" "$R"
+    printf '%s%s╰%s╯%s\e[K\n\n' "$sp" "$GR" "$hr" "$R"
+    printf '%s' "$sp"
+    case "$rodape" in
+      home) tecla "↑↓" "mover"; tecla "1-9" "abrir direto"; tecla "enter" "abrir"; tecla "n" "nova"; tecla "r" "renomear"; tecla "d" "apagar"; tecla "q" "sair" ;;
+      cli)  tecla "↑↓" "mover"; tecla "enter" "escolher"; tecla "q" "voltar" ;;
+    esac
+    printf '\e[K\n\n%s%sCriador: Thiago Dias%s\e[K\n\e[J' "$sp" "$GR" "$R"
+    IFS= read -rsn1 key
+    if [ "$key" = $'\e' ]; then read -rsn2 -t 1 rest; key="$key$rest"; fi
+    case "$key" in
+      $'\e[A'|k) LSEL=$(( (LSEL-1+n) % n )) ;;
+      $'\e[B'|j) LSEL=$(( (LSEL+1) % n )) ;;
+      "") LKEY=enter; return ;;
+      [1-9]) if [ $((key-1)) -lt "$n" ]; then LSEL=$((key-1)); LKEY=enter; return; fi ;;
+      n|d|r|q) LKEY="$key"; return ;;
+      $'\e') LKEY=q; return ;;
+    esac
+  done
+}
+
+sair_tela() { trap - EXIT; tput cnorm; tput rmcup; }
+
+tela() {
+  [ -t 0 ] && [ -t 1 ] || { echo "a tela precisa de um terminal" >&2; return 1; }
+  export LC_CTYPE=en_US.UTF-8
+  local c a n cli nome salvo
+  LSEL=0
+  trap 'tput cnorm; tput rmcup' EXIT
+  tput smcup; tput civis
+  while :; do
+    L_CLI=(); L_NOME=(); L_ID=(); L_ST=(); L_USO=()
+    for c in $CLIS; do for a in $(contas_de "$c"); do L_CLI+=("$c"); L_ID+=("$a"); L_NOME+=("$(rotulo "$c" "$a")"); L_ST+=("$(status_login "$c" "$a")"); L_USO+=("$(ultimo_uso "$c" "$a")"); done; done
+    n=${#L_CLI[@]}
+    L_CLI+=("+"); L_NOME+=("nova conta"); L_ID+=(""); L_ST+=(""); L_USO+=("")
+    [ "$LSEL" -gt "$n" ] && LSEL=$n
+    lista_tui "suas contas" home
+    case "$LKEY" in
+      q) break ;;
+      r) if [ "$LSEL" -lt "$n" ]; then
+           cli="${L_CLI[$LSEL]}"; nome="${L_NOME[$LSEL]}"
+           tput cnorm; printf '\n\n  \e[1mrenomear %s/%s\e[0m para: ' "$cli" "$nome"; read -r a
+           case "$a" in ""|*[!a-zA-Z0-9_-]*) ;; *) renomear "$cli" "${L_ID[$LSEL]}" "$a" 2>/dev/null ;; esac
+           tput civis
+         fi ;;
+      d) if [ "$LSEL" -lt "$n" ]; then
+           cli="${L_CLI[$LSEL]}"; nome="${L_NOME[$LSEL]}"
+           tput cnorm; printf '\n  \e[1;38;2;255;120;120mapagar %s/%s e o login?\e[0m digite sim: ' "$cli" "$nome"; read -r a
+           [ "$a" = sim ] && rm -rf "${RAIZ:?}/$cli/${L_ID[$LSEL]}"
+           tput civis
+         fi ;;
+      n|enter)
+        if [ "$LKEY" = enter ] && [ "$LSEL" -lt "$n" ]; then
+          sair_tela; rodar "${L_CLI[$LSEL]}" "${L_ID[$LSEL]}"; return
+        fi
+        # nova conta: primeiro escolhe o CLI, depois o nome
+        salvo=$LSEL; L_CLI=(); L_NOME=(); L_ST=(); L_USO=(); LSEL=0
+        for c in $CLIS; do L_CLI+=("$c"); L_NOME+=("$(nome_bonito "$c")$(command -v "$(bin_do "$c")" >/dev/null || echo "  (falta instalar)")"); done
+        lista_tui "qual CLI?" cli
+        if [ "$LKEY" = enter ]; then
+          cli="${L_CLI[$LSEL]}"
+          tput cnorm; printf '\e[H\e[2J\n\n  \e[1m%s\e[0m: nome da conta (ex.: trabalho, pessoal): ' "$(nome_bonito "$cli")"; read -r nome
+          case "$nome" in ""|*[!a-zA-Z0-9_-]*) ;; *)
+            if nome_livre "$cli" "$nome" && [ ! -d "$RAIZ/$cli/$nome" ]; then
+              preparar "$cli" "$RAIZ/$cli/$nome"
+              sair_tela; echo "conta criada. Faça o login dentro do $cli."; rodar "$cli" "$nome"; return
+            fi ;; esac
+          tput civis
+        fi
+        LSEL=$salvo ;;
+    esac
+  done
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  "") tela ;;
+  -v|--version|version) echo "ailogin $VERSAO" ;;
+  -h|--help|help) sed -n '2,/^set -u/p' "$0" | sed '$d; s/^# \{0,1\}//' ;;
+  ultima|last)
+    best=""; bm=0
+    for c in $CLIS; do for a in $(contas_de "$c"); do
+      m="$(mtime "$RAIZ/$c/$a/.ailogin-uso")"; m="${m:-0}"
+      [ "$m" -gt "$bm" ] && { bm=$m; best="$c $a"; }
+    done; done
+    [ -n "$best" ] || { echo "nenhuma conta usada ainda" >&2; exit 1; }
+    shift; rodar $best "$@" ;;
+  ls)
+    for c in $CLIS; do
+      l="$(contas_de "$c")"; [ -n "$l" ] && { echo "$c:"; for a in $l; do echo "  $(rotulo "$c" "$a")"; done; }
+    done ;;
+  rename)
+    cli="${2:-}"; valida_cli "$cli"; valida_nome "${4:-}"
+    id="$(resolver "$cli" "${3:-}")"; [ -n "$id" ] || { echo "conta '${3:-}' não existe em $cli" >&2; exit 1; }
+    renomear "$cli" "$id" "$4" && echo "renomeada: $3 → $4" ;;
+  add)
+    cli="${2:-}"; conta="${3:-}"; valida_cli "$cli"; valida_nome "$conta"
+    { [ -d "$RAIZ/$cli/$conta" ] || ! nome_livre "$cli" "$conta"; } && { echo "já existe" >&2; exit 1; }
+    preparar "$cli" "$RAIZ/$cli/$conta"
+    echo "conta criada. Abrindo $cli para você fazer o login (cada CLI tem seu comando: /login, login, etc.)."
+    rodar "$cli" "$conta" ;;
+  login)
+    cli="${2:-}"; valida_cli "$cli"; rodar "$cli" "$(resolver "$cli" "${3:-}")" ;;
+  rm)
+    cli="${2:-}"; valida_cli "$cli"; valida_nome "${3:-}"
+    id="$(resolver "$cli" "$3")"; [ -n "$id" ] || { echo "não existe" >&2; exit 1; }
+    read -r -p "apagar $cli/$3 e o login dela? (digite sim) " r
+    [ "$r" = sim ] && rm -rf "${RAIZ:?}/$cli/$id" && echo apagada ;;
+  *)
+    valida_cli "$cmd"; shift
+    if [ -n "${1:-}" ] && [ -n "$(resolver "$cmd" "$1")" ]; then conta="$(resolver "$cmd" "$1")"; shift; rodar "$cmd" "$conta" "$@"
+    else menu_cli "$cmd" "$@"; fi ;;
+esac
